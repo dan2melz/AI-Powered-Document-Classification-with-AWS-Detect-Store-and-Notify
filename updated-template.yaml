@@ -1,0 +1,140 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Resources:
+  # Creates an S3 bucket to store uploaded documents for classification
+  S3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: ai-classified-info-check
+
+  # Creates a DynamoDB table to store the detected classified terms from documents
+  ClassifiedInfoTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: ClassifiedInfo
+      AttributeDefinitions:
+        - AttributeName: DocumentKey
+          AttributeType: S
+      KeySchema:
+        - AttributeName: DocumentKey
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+
+  # Creates an SNS topic to send notifications when classified terms are detected
+  SNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: ClassifiedInfoNotifications
+
+  # Defines an IAM role for the Lambda function, granting it permissions to access Comprehend, DynamoDB, S3, and SNS
+  ComprehendRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: ComprehendLambdaRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ComprehendPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - comprehend:DetectEntities
+                  - comprehend:DetectKeyPhrases
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource: !Sub 'arn:aws:s3:::${S3Bucket}/*'
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                Resource: !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/ClassifiedInfo'
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref SNSTopic
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+
+  # Creates the Lambda function that processes the uploaded documents using Comprehend and stores the results in DynamoDB
+  LambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: ClassifiedInfoChecker
+      Handler: index.lambda_handler
+      Runtime: python3.9
+      Role: !GetAtt ComprehendRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          from decimal import Decimal
+
+          s3 = boto3.client('s3')
+          comprehend = boto3.client('comprehend')
+          dynamodb = boto3.resource('dynamodb')
+          sns = boto3.client('sns')
+
+          table = dynamodb.Table('ClassifiedInfo')
+
+          def lambda_handler(event, context):
+              bucket = event['Records'][0]['s3']['bucket']['name']
+              key = event['Records'][0]['s3']['object']['key']
+              response = s3.get_object(Bucket=bucket, Key=key)
+              document_content = response['Body'].read().decode('utf-8')
+
+              # Analyze the document with Comprehend
+              result = comprehend.detect_entities(
+                  Text=document_content,
+                  LanguageCode='en'
+              )
+              classified_terms = [
+                  {
+                      'Text': entity['Text'],
+                      'Type': entity['Type'],
+                      'Score': Decimal(str(entity['Score']))  # Convert float to Decimal
+                  }
+                  for entity in result['Entities'] if entity['Score'] > 0.9
+              ]
+
+              # Store results in DynamoDB
+              table.put_item(
+                  Item={
+                      'DocumentKey': key,
+                      'ClassifiedTerms': classified_terms
+                  }
+              )
+
+              # Notify if classified terms are detected
+              if classified_terms:
+                  sns.publish(
+                      TopicArn='arn:aws:sns:us-east-2:605134446096:ClassifiedInfoNotifications',
+                      Message=f"Classified terms detected in document {key}: {classified_terms}",
+                      Subject="Classified Information Alert"
+                  )
+
+              print(f"Classified Terms stored for {key}: {classified_terms}")
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps({'classified_terms': classified_terms})
+              }
+
+  # Adds permissions for the S3 bucket to trigger the Lambda function on document uploads
+  S3BucketPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt LambdaFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceArn: !GetAtt S3Bucket.Arn
